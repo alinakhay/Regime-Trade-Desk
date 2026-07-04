@@ -1,0 +1,2 @@
+[console_scripts]
+regime-trade-desk = regime_trade_desk.cli:main

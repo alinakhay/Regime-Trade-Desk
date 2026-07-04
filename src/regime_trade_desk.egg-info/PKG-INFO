@@ -1,0 +1,310 @@
+Metadata-Version: 2.4
+Name: regime-trade-desk
+Version: 0.1.0
+Summary: Deterministic three-pillar (Trend / Momentum / Macro-Sentiment) technical analysis engine for an AI trading agent to call as a calculator.
+Author: Alina Khaybullina
+License: MIT
+Keywords: technical-analysis,trading,indicators,agent,claude
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Office/Business :: Financial :: Investment
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Dynamic: license-file
+
+# Regime Trade Desk
+
+A personal trading desk for short-term technical analysis and position management on stocks and ETFs. It pairs the fetching, reasoning and conversational ability of an AI agent with a small, deterministic Python engine that does every actual calculation — no indicator is ever eyeballed or estimated by the agent.
+
+The ruling principle is simple: **the agent fetches data and talks to you; the engine computes; you decide and approve every action.**
+
+---
+
+## 🚀 Project Architecture
+
+The project is split cleanly in two: a conversational layer (an AI agent, wired up via [`SKILL.md`](SKILL.md)) that knows how to fetch market data and present results, and a local, dependency-free Python package that turns raw price bars into a scorecard and a recommendation. The package only touches the Python standard library, so every run is fast, reproducible, and needs no internet access once it has the bars.
+
+```mermaid
+graph TD
+    A[Market Data Source<br/>broker / data API] -- OHLCV closes, quotes --> B[AI Agent]
+    C[News / Analyst Source<br/>web] -- yield spread, headlines --> B
+    B -- closes for 7 cross-asset ETFs --> D[MacroEngine]
+    B -- closes + holding status --> E[AssetScorer]
+    D -- Macro-Sentiment score --> E
+    E -- Scorecard: 3 pillars + Decision --> B
+    B -- Visualized proposal --> G[You]
+    G -- Confirmation --> A
+```
+
+Under the hood, `AssetScorer` — the one class an agent actually needs to know about — is a thin facade over a chain of small, single-purpose classes. Indicators feed the pillars, the pillars and an injected macro score feed the decision engine, and the decision engine runs a prioritized chain of rules to reach one recommendation:
+
+```mermaid
+graph LR
+    subgraph indicators
+        EMA & RSIWilder & MACD & TRIX & BollingerBands --> IndicatorEngine
+    end
+    subgraph pillars
+        IndicatorEngine --> TrendPillar
+        IndicatorEngine --> MomentumPillar
+        MacroComponent["RatioTrendComponent /<br/>YieldCurveComponent"] --> MacroEngine
+        MacroEngine --> RegimeClassifier
+    end
+    subgraph decision
+        FlagDetector --> DecisionEngine
+        DecisionRule["ordered rule chain<br/>(exhaustion, exit, re-entry, ...)"] --> DecisionEngine
+        DecisionEngine --> MacroFramingAdjuster --> PositionContextAdjuster
+    end
+    TrendPillar & MomentumPillar --> AssetScorer
+    MacroEngine -. injected macro_score .-> AssetScorer
+    AssetScorer --> DecisionEngine
+    AssetScorer --> Scorecard
+    Scorecard --> TextRenderer & JSONRenderer
+```
+
+Each box above is a small, independently unit-tested class rather than one big script — swapping in a different momentum rule, a new macro component, or a different report format never touches the rest of the pipeline.
+
+### File Structure
+
+```
+src/regime_trade_desk/
+├── domain/        # shared value objects: ClosePrices, TimeSeries, IndicatorSnapshot,
+│                  # PillarScore, Flags, Decision, MacroReading, and the Action/Regime enums
+├── indicators/    # EMA, SMA, RSI (Wilder), MACD, TRIX, Bollinger Bands -> IndicatorEngine
+├── pillars/
+│   ├── trend.py   # TrendPillar
+│   ├── momentum.py# MomentumPillar
+│   └── macro/     # cross-asset components + RegimeClassifier -> MacroEngine
+├── decision/      # flag detection + the exit/re-entry rule chain -> DecisionEngine
+├── scoring/       # AssetScorer — the public entry point -> Scorecard
+├── reporting/     # human-readable and JSON renderers
+├── io/            # turns raw JSON payloads into the typed objects above
+└── cli.py         # `regime-trade-desk indicators|macro|score`
+tests/             # pytest suite covering every layer above
+SKILL.md           # operations manual + guardrails for the AI agent
+```
+
+* **[SKILL.md](SKILL.md)**: operations manual and guardrails guiding the agent's actions.
+* **[src/regime_trade_desk/indicators/](src/regime_trade_desk/indicators/)**: the mathematical engine — technical indicators computed exactly, never estimated.
+* **[src/regime_trade_desk/pillars/macro/](src/regime_trade_desk/pillars/macro/)**: the macro regime detector and cross-asset sentiment scorer.
+* **[src/regime_trade_desk/scoring/scorecard.py](src/regime_trade_desk/scoring/scorecard.py)**: `AssetScorer`, the facade that ties indicators, pillars and the decision engine into one scorecard.
+
+---
+
+## 📈 The Three-Pillar Framework
+
+Each analyzed asset is scored in three independent categories, each from **-2 to +2** (for a consolidated total range of **-6 to +6**). The idea is that no single signal decides anything on its own — trend, momentum and the macro backdrop all have to line up before the desk calls a clear entry or exit.
+
+### 1. Trend
+Determined by [`TrendPillar`](src/regime_trade_desk/pillars/trend.py) using:
+*   Price position relative to the **EMA 20**.
+*   Structural crossovers between exponential moving averages: **EMA 20 > EMA 50** and **EMA 50 > EMA 200**.
+*   Slope direction of the **EMA 200** (measured relative to 5 bars ago).
+
+### 2. Momentum
+Determined by [`MomentumPillar`](src/regime_trade_desk/pillars/momentum.py) combining:
+*   **RSI-14** using **Wilder's** smoothing (neutral zone from 45 to 55).
+*   Sign of the **MACD (12, 26, 9)** histogram.
+*   **TRIX-15** (triple EMA rate of change) compared against its EMA-9 signal line.
+
+**Bollinger Bands** (20/2, population σ) are also computed and used as a supporting exhaustion signal (`%B ≥ 1` flags price at/above the upper band), but they do not feed into the numeric momentum score.
+
+### 3. Macro-Sentiment (Macro Environment)
+Calculated by [`MacroEngine`](src/regime_trade_desk/pillars/macro/engine.py), a cross-asset analysis that weights the following components:
+*   **Market Concentration**: RSP/SPY (equal-weight vs. cap-weight S&P 500).
+*   **Yield Curve**: 10Y-2Y treasury yield spread (injected from whatever trusted source you fetch it from).
+*   **Corporate Credit**: HYG/LQD ratio (high-yield vs. investment-grade).
+*   **Size Factor**: IWM/SPY ratio (small caps vs. large caps).
+*   **Asset Preference**: SPY/TLT ratio (equities vs. bonds).
+*   **Sector Rotation**: XLY/XLP ratio (cyclical vs. defensive sectors).
+*   **Inflationary Correlation**: rolling SPY-TLT correlation, used to flag an *Inflationary* regime.
+
+The weighted composite is mapped onto a regime label (*Broadening, Concentration, Contraction, Inflationary, Transitional*) and then onto the -2..+2 Macro-Sentiment pillar score.
+
+---
+
+## 🛠️ Installation
+
+```bash
+pip install -e ".[dev]"   # editable install, plus pytest for the test suite
+```
+
+## 🧮 CLI Usage
+
+The engine is run via the command line, consuming and producing JSON.
+
+### 1. Raw Indicators Computation
+To get the full breakdown of every calculated indicator for an asset:
+```bash
+regime-trade-desk indicators ticker.json
+```
+*Expected format for `ticker.json`:*
+```json
+{
+  "close": [100.5, 101.2, 102.0, 101.8, 103.1, "..."]
+}
+```
+
+### 2. Macro-Sentiment Scoring
+To calculate the regime and macro pillar for the session:
+```bash
+regime-trade-desk macro macro_input.json --json
+```
+*Expected format for `macro_input.json`:*
+```json
+{
+  "as_of": "2026-07-02",
+  "yield_spread": -0.15,
+  "series": {
+    "SPY": [450.1, 452.3, "..."],
+    "RSP": [152.0, 151.8, "..."],
+    "IWM": [198.5, "..."],
+    "HYG": ["..."],
+    "LQD": ["..."],
+    "TLT": ["..."],
+    "XLY": ["..."],
+    "XLP": ["..."]
+  }
+}
+```
+
+### 3. Ticker Scoring and Decision
+To get the complete three-pillar scorecard and action suggestion:
+```bash
+regime-trade-desk score ticker_input.json         # human-readable table
+regime-trade-desk score ticker_input.json --json  # machine-readable output
+regime-trade-desk score                            # self-test with synthetic data
+```
+*Expected format for `ticker_input.json`:*
+```json
+{
+  "symbol": "AAPL",
+  "close": [220.5, 222.1, 221.8, "..."],
+  "macro_score": 1,
+  "holding": true
+}
+```
+
+Every subcommand runs a deterministic self-test on synthetic data when no input file is given — a quick way to sanity-check the install with zero setup.
+
+## 🐍 Python API
+
+The CLI is a thin wrapper; you can call the same engine directly from Python:
+
+```python
+from regime_trade_desk import AssetScorer
+from regime_trade_desk.domain.series import ClosePrices
+
+scorecard = AssetScorer().score(
+    ClosePrices(closes), symbol="AAPL", macro_score=1, holding=True,
+)
+print(scorecard.decision.action, scorecard.pillar_total)
+print(scorecard.decision.framing)
+```
+
+### Decisions
+
+The output includes the three-pillar scorecard, active flags (exhaustion / bearish / rebound / death-cross), and one of the following decisions:
+
+| Decision | Context |
+|---|---|
+| `EXIT / TRIM` | Holding — bullish momentum exhausted |
+| `EXIT` | Holding — bearish momentum relentless |
+| `RE-ENTRY (new cycle)` | Flat — rebound with healthy EMA structure |
+| `TACTICAL REBOUND (counter-trend)` | Flat — rebound inside a death-cross (reduced size, tight stop) |
+| `HOLD (ride the cycle)` | Holding — trend and momentum positive |
+| `HOLD (under review)` | Holding — weak signals, no full exit trigger yet |
+| `WAIT (do not chase)` | Flat — healthy trend but no fresh entry trigger |
+| `STAY OUT / AVOID` | Flat — relentless bearish, no rebound |
+| `HOLD / OBSERVE` or `OBSERVE` | Mixed signals — no action, watch next close |
+
+Before selecting a decision, [`FlagDetector`](src/regime_trade_desk/decision/flags.py) looks for specific indicator patterns that signal exhaustion (e.g. RSI turning down from overbought, a shrinking MACD histogram), bearish persistence, or rebound triggers. [`DecisionEngine`](src/regime_trade_desk/decision/engine.py) then walks those flags through an ordered rule chain — exit triggers take priority for a held position, entry triggers take priority when flat — falling back to a plain "observe" if nothing fires. When `macro_score ≤ -1`, the framing is tightened (smaller size, earlier profit-taking) but the numeric pillar scores themselves are never touched by macro or qualitative context.
+
+---
+
+## 🤖 Claude Code Integration
+
+To use this project as a **Skill** with Claude Code for automated trading analysis:
+
+### 1. Add the Skill
+Place [`SKILL.md`](SKILL.md) (and this repository) in your Claude Code skills directory, or reference it directly from wherever you've cloned it:
+```bash
+cp -r /path/to/regime-trade-desk ~/.claude/code/skills/regime-trade-desk
+```
+
+### 2. Agent Operation
+Once loaded, the agent will:
+* Automatically use this skill when you ask to analyze tickers, review positions, or make trading decisions
+* Fetch market data through whatever tool/MCP you have connected
+* Call `regime-trade-desk` for every calculation — never estimate an indicator by reasoning over the bars
+* Present the three-pillar scorecard with an actionable decision
+* **Never execute an order without your explicit confirmation**
+
+### 3. Example Workflow
+
+```
+You: "Analyze AAPL for a potential entry"
+
+1. Data Fetching
+   → Fetches AAPL daily closes (~290 bars, enough for EMA 200)
+   → Fetches the live/last price
+   → Checks for an open position → sets holding = true/false
+
+2. Macro Pillar (once per session, shared across all tickers)
+   → Fetches closes for 7 ETFs: SPY, RSP, IWM, HYG, LQD, TLT, XLY, XLP
+   → Fetches the 10Y-2Y yield spread from a trusted source
+   → Runs: regime-trade-desk macro → macro_score (-2 to +2)
+
+3. Ticker Scoring
+   → Assembles {symbol, close, macro_score, holding}
+   → Runs: regime-trade-desk score → three-pillar scorecard + decision
+
+4. Qualitative Context (reinforcement, does not alter scores)
+   → News and macro context from a trusted source
+   → Analyst consensus and price targets, if available
+
+5. Presentation and Confirmation
+   → Returns: scorecard, flags, and suggested action (RE-ENTRY, HOLD, EXIT, etc.)
+   → You review and confirm before anything is executed
+```
+
+---
+
+## 📰 External Qualitative Context (Reinforcement)
+
+To complement the purely technical nature of the deterministic engine, the agent can bring in a qualitative reinforcement pass before presenting the final recommendation:
+
+1.  **News and Macro**: pulled from a single trusted financial data/news source — deliberately not a source that mixes in unmoderated user content, to avoid prompt-injection risk.
+2.  **Analyst Consensus and Reports**, where your connected tools expose them:
+    *   Overall consensus (*Buy/Hold/Sell*).
+    *   12-month price targets (average, maximum, minimum) against the current price.
+    *   Recent earnings results (actual vs. estimated).
+    *   Recent analyst rating changes (< 2 weeks).
+
+This information is presented alongside the three-pillar scorecard as interpretive context — **it never alters** the mathematical score. The quantitative triggers and risk management stay 100% deterministic.
+
+---
+
+## 🧪 Tests
+
+```bash
+pytest
+```
+
+The suite covers every layer: indicator correctness (constant-series EMA, monotonic-series RSI, the MACD = EMA12-EMA26 identity), pillar scoring boundaries, macro regime classification and weight redistribution when data is missing, the full decision rule cascade (via dependency-injected stubs, so each rule is testable in isolation), and end-to-end scorecard checks pinned against known-good values for the synthetic self-test datasets.
+
+---
+
+## 🛡️ Guardrails and Operation (Non-Negotiable)
+
+1.  **Protected Position Protection**: certain positions can be designated as *protected* (e.g. restricted stock grants). Protected tickers are never evaluated for selling or trimming in exit suggestions.
+2.  **Mandatory Confirmation**: every action this desk suggests is a *suggestion*. It never places, modifies, or cancels an order by itself — the agent must get your explicit, real-time confirmation before anything is executed. If your tools expose a simulation/dry-run call, use it first.
+3.  **Deterministic core stays deterministic**: news, analyst ratings, and any other qualitative context can be presented alongside the scorecard, but they never move a pillar score — only the human-readable framing around it.
+4.  **Trusted sources only**: prefer a single, well-known financial data or news source over ones that mix in unmoderated content, for macro and news context.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
