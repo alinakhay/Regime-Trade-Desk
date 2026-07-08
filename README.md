@@ -1,4 +1,4 @@
-# Regime Trade Desk
+# Quant Regime Engine
 
 A systematic, multi-factor technical analysis engine for short-term equity and ETF position management. Regime Trade Desk fuses an AI agent's data-sourcing and natural-language interface with a deterministic, quant-grade scoring core: every indicator, every factor, every regime read is computed exactly — never approximated, never left to a model's judgment.
 
